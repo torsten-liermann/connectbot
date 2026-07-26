@@ -129,6 +129,7 @@ import org.connectbot.R
 import org.connectbot.data.entity.Host
 import org.connectbot.service.AuthBanner
 import org.connectbot.service.DisconnectReason
+import org.connectbot.service.MouseWheelDirection
 import org.connectbot.service.PromptRequest
 import org.connectbot.service.TerminalBridge
 import org.connectbot.terminal.ProgressState
@@ -168,6 +169,7 @@ private fun rememberHasHardwareKeyboard(): Boolean {
 
 @VisibleForTesting
 const val AUTO_HIDE_DELAY_MS = 3000L
+private const val REMOTE_MOUSE_WHEEL_ROWS_PER_EVENT = 3f
 
 internal object ConsoleTestTags {
     const val AUTH_BANNER_MESSAGE = "auth_banner_message"
@@ -276,13 +278,17 @@ internal fun shouldPreserveSoftwareKeyboardForBridgeChange(
     showSoftwareKeyboard &&
     !hasHardwareKeyboard
 
-private fun Modifier.sessionSwipeNavigation(
+private fun Modifier.terminalGestureNavigation(
     currentIndex: Int,
     sessionCount: Int,
+    swipeBetweenSessions: Boolean,
     selectionActive: Boolean,
     onSwipeToSession: (Int) -> Unit,
+    isRemoteMouseTrackingEnabled: () -> Boolean,
+    remoteTerminalRows: () -> Int,
+    onRemoteMouseWheel: (MouseWheelDirection, Float, Float, Int, Int) -> Boolean,
     onInteraction: () -> Unit,
-): Modifier = pointerInput(currentIndex, sessionCount, selectionActive) {
+): Modifier = pointerInput(currentIndex, sessionCount, swipeBetweenSessions, selectionActive) {
     if (selectionActive) {
         return@pointerInput
     }
@@ -294,6 +300,8 @@ private fun Modifier.sessionSwipeNavigation(
         var dragY = 0f
         var horizontalSwipeLocked = false
         var verticalGestureLocked = false
+        var remoteMouseWheelAccumulator = 0f
+        val remoteMouseGestureEnabled = isRemoteMouseTrackingEnabled()
 
         while (true) {
             val event = awaitPointerEvent(PointerEventPass.Initial)
@@ -309,15 +317,54 @@ private fun Modifier.sessionSwipeNavigation(
             if (!horizontalSwipeLocked && !verticalGestureLocked) {
                 val absX = abs(dragX)
                 val absY = abs(dragY)
-                if (absX > viewConfiguration.touchSlop && absX > absY * 1.5f) {
+                if (swipeBetweenSessions &&
+                    absX > viewConfiguration.touchSlop &&
+                    absX > absY * 1.5f
+                ) {
                     horizontalSwipeLocked = true
-                } else if (absY > viewConfiguration.touchSlop && absY > absX) {
+                } else if (remoteMouseGestureEnabled &&
+                    absY > viewConfiguration.touchSlop &&
+                    absY > absX
+                ) {
                     verticalGestureLocked = true
                 }
             }
 
             if (horizontalSwipeLocked) {
                 change.consume()
+            } else if (verticalGestureLocked) {
+                change.consume()
+                remoteMouseWheelAccumulator += delta.y
+
+                val terminalRows = remoteTerminalRows().coerceAtLeast(1)
+                val cellHeight = size.height.toFloat() / terminalRows
+                val eventDistance = max(
+                    viewConfiguration.touchSlop * 2f,
+                    cellHeight * REMOTE_MOUSE_WHEEL_ROWS_PER_EVENT,
+                )
+
+                while (abs(remoteMouseWheelAccumulator) >= eventDistance) {
+                    val direction = if (remoteMouseWheelAccumulator > 0f) {
+                        MouseWheelDirection.UP
+                    } else {
+                        MouseWheelDirection.DOWN
+                    }
+                    val sent = onRemoteMouseWheel(
+                        direction,
+                        change.position.x,
+                        change.position.y,
+                        size.width,
+                        size.height,
+                    )
+                    if (!sent) break
+
+                    remoteMouseWheelAccumulator += if (remoteMouseWheelAccumulator > 0f) {
+                        -eventDistance
+                    } else {
+                        eventDistance
+                    }
+                    onInteraction()
+                }
             }
         }
 
@@ -926,17 +973,17 @@ fun ConsoleScreen(
                             .weight(1f),
                     ) {
                         val bridge = uiState.bridges[uiState.currentBridgeIndex]
-                        val terminalModifier = if (swipeBetweenSessions) {
-                            Modifier.sessionSwipeNavigation(
-                                currentIndex = uiState.currentBridgeIndex,
-                                sessionCount = uiState.bridges.size,
-                                selectionActive = terminalSelectionActive,
-                                onSwipeToSession = { index -> selectBridgePreservingKeyboard(index) },
-                                onInteraction = { handleTerminalInteraction(isInteraction = false) },
-                            )
-                        } else {
-                            Modifier
-                        }
+                        val terminalModifier = Modifier.terminalGestureNavigation(
+                            currentIndex = uiState.currentBridgeIndex,
+                            sessionCount = uiState.bridges.size,
+                            swipeBetweenSessions = swipeBetweenSessions,
+                            selectionActive = terminalSelectionActive,
+                            onSwipeToSession = { index -> selectBridgePreservingKeyboard(index) },
+                            isRemoteMouseTrackingEnabled = bridge::isRemoteMouseTrackingEnabled,
+                            remoteTerminalRows = { bridge.terminalEmulator.dimensions.rows },
+                            onRemoteMouseWheel = bridge::sendRemoteMouseWheel,
+                            onInteraction = { handleTerminalInteraction(isInteraction = false) },
+                        )
 
                         key(bridge.host.id) {
                             ConsoleTerminalPage(

@@ -134,6 +134,7 @@ class TerminalBridge {
     }
 
     private val transportOperations = Channel<TransportOperation>(Channel.UNLIMITED)
+    private val remoteMouseTracking = RemoteMouseTracking()
 
     var color: IntArray = IntArray(0)
 
@@ -617,6 +618,40 @@ class TerminalBridge {
     fun sendBytes(data: ByteArray) {
         if (data.isEmpty()) return
         transportOperations.trySend(TransportOperation.WriteData(data))
+    }
+
+    internal fun observeRemoteOutput(data: ByteArray, offset: Int, length: Int) {
+        remoteMouseTracking.consume(data, offset, length)
+    }
+
+    internal fun resetRemoteMouseTracking() {
+        remoteMouseTracking.reset()
+    }
+
+    internal fun isRemoteMouseTrackingEnabled(): Boolean = remoteMouseTracking.isEnabled
+
+    internal fun sendRemoteMouseWheel(
+        direction: MouseWheelDirection,
+        pointerX: Float,
+        pointerY: Float,
+        viewportWidth: Int,
+        viewportHeight: Int,
+    ): Boolean {
+        if (viewportWidth <= 0 || viewportHeight <= 0) return false
+
+        val dimensions = terminalEmulator.dimensions
+        if (dimensions.columns <= 0 || dimensions.rows <= 0) return false
+
+        val column = ((pointerX / viewportWidth) * dimensions.columns)
+            .toInt()
+            .coerceIn(0, dimensions.columns - 1)
+        val row = ((pointerY / viewportHeight) * dimensions.rows)
+            .toInt()
+            .coerceIn(0, dimensions.rows - 1)
+        val event = remoteMouseTracking.encodeWheelEvent(direction, row, column) ?: return false
+
+        sendBytes(event)
+        return true
     }
 
     /**
